@@ -19,7 +19,7 @@ build:
     - "protobuf==5.27.3"
     - "numpy==1.26.4"
     - "pillow==10.4.0"
-    - "optimum==1.21.3"
+    - "optimum-quanto==0.2.4"
 
 
   run:
