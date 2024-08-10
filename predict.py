@@ -9,17 +9,14 @@ import subprocess
 import numpy as np
 from PIL import Image
 from typing import List
-from diffusers import FluxPipeline
-from transformers import CLIPImageProcessor
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker
-)
+
+from diffusers import FluxTransformer2DModel, FluxPipeline
+from transformers import CLIPImageProcessor,T5EncoderModel, CLIPTextModel
+from optimum.quanto import freeze, qfloat8, quantize
 
 MODEL_CACHE = "checkpoints"
-MODEL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/model.tar"
-SAFETY_CACHE = "safety-cache"
+MODEL_URL = "https://huggingface.co/Kijai/flux-fp8/blob/main/flux1-dev-fp8.safetensors"
 FEATURE_EXTRACTOR = "/src/feature-extractor"
-SAFETY_URL = "https://weights.replicate.delivery/default/sdxl/safety-1.0.tar"
 
 def download_weights(url, dest):
     start = time.time()
@@ -32,22 +29,27 @@ class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
         start = time.time()
-
-        print("Loading safety checker...")
-        if not os.path.exists(SAFETY_CACHE):
-            download_weights(SAFETY_URL, SAFETY_CACHE)
-        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_CACHE, torch_dtype=torch.float16
-        ).to("cuda")
         self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
         
         print("Loading Flux txt2img Pipeline")
         if not os.path.exists(MODEL_CACHE):
             download_weights(MODEL_URL, MODEL_CACHE)
-        self.txt2img_pipe = FluxPipeline.from_pretrained(
-            MODEL_CACHE,
-            torch_dtype=torch.bfloat16
-        ).to("cuda")
+       
+        bfl_repo = "black-forest-labs/FLUX.1-dev"
+        dtype = torch.bfloat16
+
+        transformer = FluxTransformer2DModel.from_single_file(MODEL_CACHE, torch_dtype=dtype)
+        quantize(transformer, weights=qfloat8)
+        freeze(transformer)
+
+        text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype)
+        quantize(text_encoder_2, weights=qfloat8)
+        freeze(text_encoder_2)
+
+        pipe = FluxPipeline.from_pretrained(bfl_repo, transformer=None, text_encoder_2=None, torch_dtype=dtype)
+        pipe.transformer = transformer
+        pipe.text_encoder_2 = text_encoder_2
+        self.txt2img_pipe = pipe
 
         # Save some VRAM by offloading the model to CPU
         vram = int(torch.cuda.get_device_properties(0).total_memory/(1024*1024*1024))
@@ -57,15 +59,6 @@ class Predictor(BasePredictor):
         
         print("setup took: ", time.time() - start)
 
-    @torch.cuda.amp.autocast()
-    def run_safety_checker(self, image):
-        safety_checker_input = self.feature_extractor(image, return_tensors="pt").to("cuda")
-        np_image = [np.array(val) for val in image]
-        image, has_nsfw_concept = self.safety_checker(
-            images=np_image,
-            clip_input=safety_checker_input.pixel_values.to(torch.float16),
-        )
-        return image, has_nsfw_concept
 
     def aspect_ratio_to_width_height(self, aspect_ratio: str):
         aspect_ratios = {
@@ -101,10 +94,6 @@ class Predictor(BasePredictor):
             ge=0,
             le=100,
         ),
-        disable_safety_checker: bool = Input(
-            description="Disable safety checker for generated images. This feature is only available through the API. See [https://replicate.com/docs/how-does-replicate-work#safety](https://replicate.com/docs/how-does-replicate-work#safety)",
-            default=False,
-        ),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         if seed is None:
@@ -137,14 +126,11 @@ class Predictor(BasePredictor):
 
         output = pipe(**common_args, **flux_kwargs)
 
-        if not disable_safety_checker:
-            _, has_nsfw_content = self.run_safety_checker(output.images)
+    
 
         output_paths = []
         for i, image in enumerate(output.images):
-            if not disable_safety_checker and has_nsfw_content[i]:
-                print(f"NSFW content detected in image {i}")
-                continue
+
             output_path = f"/tmp/out-{i}.{output_format}"
             if output_format != 'png':
                 image.save(output_path, quality=output_quality, optimize=True)
@@ -153,7 +139,7 @@ class Predictor(BasePredictor):
             output_paths.append(Path(output_path))
 
         if len(output_paths) == 0:
-            raise Exception("NSFW content detected. Try running it again, or try a different prompt.")
+            raise Exception("No Image generated, sTry running it again, or try a different prompt.")
 
         return output_paths
     
