@@ -14,42 +14,17 @@ from diffusers import FluxTransformer2DModel, FluxPipeline
 from transformers import CLIPImageProcessor,T5EncoderModel, CLIPTextModel
 from optimum.quanto import freeze, qfloat8, quantize
 
-MODEL_CACHE = "checkpoints"
-MODEL_URL = "https://huggingface.co/Kijai/flux-fp8/blob/main/flux1-dev-fp8.safetensors"
 FEATURE_EXTRACTOR = "/src/feature-extractor"
 
-def download_weights(url, dest):
-    start = time.time()
-    print("downloading url: ", url)
-    print("downloading to: ", dest)
-    subprocess.check_call(["pget", "-x", url, dest], close_fds=False)
-    print("downloading took: ", time.time() - start)
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
         start = time.time()
+        print("Loading models...")
         self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
-        
-        print("Loading Flux txt2img Pipeline")
-        if not os.path.exists(MODEL_CACHE):
-            download_weights(MODEL_URL, MODEL_CACHE)
        
-        bfl_repo = "black-forest-labs/FLUX.1-dev"
-        dtype = torch.bfloat16
-
-        transformer = FluxTransformer2DModel.from_single_file(MODEL_CACHE, torch_dtype=dtype)
-        quantize(transformer, weights=qfloat8)
-        freeze(transformer)
-
-        text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype)
-        quantize(text_encoder_2, weights=qfloat8)
-        freeze(text_encoder_2)
-
-        pipe = FluxPipeline.from_pretrained(bfl_repo, transformer=None, text_encoder_2=None, torch_dtype=dtype)
-        pipe.transformer = transformer
-        pipe.text_encoder_2 = text_encoder_2
-        self.txt2img_pipe = pipe
+        self.txt2img_pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16).to("cuda")
 
         # Save some VRAM by offloading the model to CPU
         vram = int(torch.cuda.get_device_properties(0).total_memory/(1024*1024*1024))
@@ -57,6 +32,7 @@ class Predictor(BasePredictor):
             print("GPU VRAM < 50Gb - Offloading model to CPU")
             self.txt2img_pipe.enable_model_cpu_offload()
         
+        print("Models loaded")
         print("setup took: ", time.time() - start)
 
 
@@ -126,8 +102,6 @@ class Predictor(BasePredictor):
 
         output = pipe(**common_args, **flux_kwargs)
 
-    
-
         output_paths = []
         for i, image in enumerate(output.images):
 
@@ -142,4 +116,3 @@ class Predictor(BasePredictor):
             raise Exception("No Image generated, sTry running it again, or try a different prompt.")
 
         return output_paths
-    
