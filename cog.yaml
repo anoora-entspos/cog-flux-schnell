@@ -19,8 +19,11 @@ build:
     - "protobuf==5.27.3"
     - "numpy==1.26.4"
     - "pillow==10.4.0"
+    - "optimum-quanto==0.2.4"
 
   run:
     - curl -o /usr/local/bin/pget -L "https://github.com/replicate/pget/releases/latest/download/pget_$(uname -s)_$(uname -m)" && chmod +x /usr/local/bin/pget
+
+image: "r8.im/syedusama5556/flux-schnell-cog"
 
 predict: "predict.py:Predictor"
